@@ -1,4 +1,5 @@
-# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
+# Lint as: python2, python3
+# Copyright 2019 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,18 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+# ==============================================================================
 """Utility functions for input processing."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import math
+import numpy as np
+from six.moves import range
+import tensorflow.compat.v1 as tf
 
-import tensorflow as tf
-
-from official.vision.detection.utils import box_utils
-from official.vision.utils.object_detection import preprocessor
+from utils import box_utils
+from utils.object_detection import preprocessor
 
 
-def pad_to_fixed_size(input_tensor, size, constant_values=0):
+CENTER_CROP_FRACTION = 0.875
+
+
+def clip_or_pad_to_fixed_size(input_tensor, size, constant_values=0):
   """Pads data to a fixed length at the first dimension.
 
   Args:
@@ -36,16 +45,18 @@ def pad_to_fixed_size(input_tensor, size, constant_values=0):
   input_shape = input_tensor.get_shape().as_list()
   padding_shape = []
 
-  # Computes the padding length on the first dimension.
-  padding_length = tf.maximum(0, size - tf.shape(input_tensor)[0])
-  assert_length = tf.Assert(
-      tf.greater_equal(padding_length, 0), [padding_length])
-  with tf.control_dependencies([assert_length]):
-    padding_shape.append(padding_length)
+  # Computes the padding length on the first dimension, clip input tensor if it
+  # is longer than `size`.
+  input_length = tf.shape(input_tensor)[0]
+  input_length = tf.clip_by_value(input_length, 0, size)
+  input_tensor = input_tensor[:input_length]
+
+  padding_length = tf.maximum(0, size - input_length)
+  padding_shape.append(padding_length)
 
   # Copies shapes of the rest of input shape dimensions.
   for i in range(1, len(input_shape)):
-    padding_shape.append(tf.shape(input=input_tensor)[i])
+    padding_shape.append(tf.shape(input_tensor)[i])
 
   # Pads input tensor to the fixed first dimension.
   paddings = tf.cast(constant_values * tf.ones(padding_shape),
@@ -57,21 +68,32 @@ def pad_to_fixed_size(input_tensor, size, constant_values=0):
   return padded_tensor
 
 
+def normalize_image_np(image,
+                       offset=(0.485, 0.456, 0.406),
+                       scale=(0.229, 0.224, 0.225)):
+  """Normalizes the image to zero mean and unit variance."""
+  normalized_image = image.astype(np.float32)
+  normalized_image /= 255.0
+  normalized_image = (normalized_image - offset) / scale
+  return normalized_image
+
+
 def normalize_image(image,
                     offset=(0.485, 0.456, 0.406),
                     scale=(0.229, 0.224, 0.225)):
   """Normalizes the image to zero mean and unit variance."""
-  image = tf.image.convert_image_dtype(image, dtype=tf.float32)
-  offset = tf.constant(offset)
-  offset = tf.expand_dims(offset, axis=0)
-  offset = tf.expand_dims(offset, axis=0)
-  image -= offset
+  with tf.name_scope('normalize_image'):
+    image = tf.image.convert_image_dtype(image, dtype=tf.float32)
+    offset = tf.constant(offset)
+    offset = tf.expand_dims(offset, axis=0)
+    offset = tf.expand_dims(offset, axis=0)
+    image -= offset
 
-  scale = tf.constant(scale)
-  scale = tf.expand_dims(scale, axis=0)
-  scale = tf.expand_dims(scale, axis=0)
-  image /= scale
-  return image
+    scale = tf.constant(scale)
+    scale = tf.expand_dims(scale, axis=0)
+    scale = tf.expand_dims(scale, axis=0)
+    image /= scale
+    return image
 
 
 def compute_padded_size(desired_size, stride):
@@ -92,12 +114,12 @@ def compute_padded_size(desired_size, stride):
       [height, width] of the padded output image size.
   """
   if isinstance(desired_size, list) or isinstance(desired_size, tuple):
-    padded_size = [
-        int(math.ceil(d * 1.0 / stride) * stride) for d in desired_size
-    ]
+    padded_size = [int(math.ceil(d * 1.0 / stride) * stride)
+                   for d in desired_size]
   else:
     padded_size = tf.cast(
-        tf.math.ceil(tf.cast(desired_size, dtype=tf.float32) / stride) * stride,
+        tf.math.ceil(
+            tf.cast(desired_size, dtype=tf.float32) / stride) * stride,
         tf.int32)
   return padded_size
 
@@ -109,7 +131,7 @@ def resize_and_crop_image(image,
                           aug_scale_max=1.0,
                           seed=1,
                           method=tf.image.ResizeMethod.BILINEAR):
-  """Resizes the input image to output size.
+  """Resizes the input image to output size (RetinaNet style).
 
   Resize and pad images given the desired output size of the image and
   stride size.
@@ -141,26 +163,24 @@ def resize_and_crop_image(image,
       applied preprocessing. It is in the format of
       [[original_height, original_width], [desired_height, desired_width],
        [y_scale, x_scale], [y_offset, x_offset]], where [desired_height,
-      desireed_width] is the actual scaled image size, and [y_scale, x_scale] is
-      the scaling factory, which is the ratio of
+      desired_width] is the actual scaled image size, and [y_scale, x_scale] is
+      the scaling factor, which is the ratio of
       scaled dimension / original dimension.
   """
   with tf.name_scope('resize_and_crop_image'):
-    image_size = tf.cast(tf.shape(input=image)[0:2], tf.float32)
+    image_size = tf.cast(tf.shape(image)[0:2], tf.float32)
 
     random_jittering = (aug_scale_min != 1.0 or aug_scale_max != 1.0)
 
     if random_jittering:
-      random_scale = tf.random.uniform([],
-                                       aug_scale_min,
-                                       aug_scale_max,
-                                       seed=seed)
+      random_scale = tf.random_uniform(
+          [], aug_scale_min, aug_scale_max, seed=seed)
       scaled_size = tf.round(random_scale * desired_size)
     else:
       scaled_size = desired_size
 
-    scale = tf.minimum(scaled_size[0] / image_size[0],
-                       scaled_size[1] / image_size[1])
+    scale = tf.minimum(
+        scaled_size[0] / image_size[0], scaled_size[1] / image_size[1])
     scaled_size = tf.round(image_size * scale)
 
     # Computes 2D image_scale.
@@ -170,30 +190,30 @@ def resize_and_crop_image(image,
     # desired_size.
     if random_jittering:
       max_offset = scaled_size - desired_size
-      max_offset = tf.where(
-          tf.less(max_offset, 0), tf.zeros_like(max_offset), max_offset)
-      offset = max_offset * tf.random.uniform([
-          2,
-      ], 0, 1, seed=seed)
+      max_offset = tf.where(tf.less(max_offset, 0),
+                            tf.zeros_like(max_offset),
+                            max_offset)
+      offset = max_offset * tf.random_uniform([2,], 0, 1, seed=seed)
       offset = tf.cast(offset, tf.int32)
     else:
       offset = tf.zeros((2,), tf.int32)
 
-    scaled_image = tf.image.resize(
+    scaled_image = tf.image.resize_images(
         image, tf.cast(scaled_size, tf.int32), method=method)
 
     if random_jittering:
-      scaled_image = scaled_image[offset[0]:offset[0] + desired_size[0],
-                                  offset[1]:offset[1] + desired_size[1], :]
+      scaled_image = scaled_image[
+          offset[0]:offset[0] + desired_size[0],
+          offset[1]:offset[1] + desired_size[1], :]
 
-    output_image = tf.image.pad_to_bounding_box(scaled_image, 0, 0,
-                                                padded_size[0], padded_size[1])
+    output_image = tf.image.pad_to_bounding_box(
+        scaled_image, 0, 0, padded_size[0], padded_size[1])
 
     image_info = tf.stack([
         image_size,
-        tf.cast(desired_size, dtype=tf.float32), image_scale,
-        tf.cast(offset, tf.float32)
-    ])
+        tf.constant(desired_size, dtype=tf.float32),
+        image_scale,
+        tf.cast(offset, tf.float32)])
     return output_image, image_info
 
 
@@ -248,25 +268,23 @@ def resize_and_crop_image_v2(image,
     image_size = tf.cast(tf.shape(image)[0:2], tf.float32)
 
     scale_using_short_side = (
-        short_side / tf.math.minimum(image_size[0], image_size[1]))
+        short_side / tf.minimum(image_size[0], image_size[1]))
     scale_using_long_side = (
-        long_side / tf.math.maximum(image_size[0], image_size[1]))
+        long_side / tf.maximum(image_size[0], image_size[1]))
 
-    scaled_size = tf.math.round(image_size * scale_using_short_side)
+    scaled_size = tf.round(image_size * scale_using_short_side)
     scaled_size = tf.where(
-        tf.math.greater(
-            tf.math.maximum(scaled_size[0], scaled_size[1]), long_side),
-        tf.math.round(image_size * scale_using_long_side), scaled_size)
+        tf.greater(tf.maximum(scaled_size[0], scaled_size[1]), long_side),
+        tf.round(image_size * scale_using_long_side),
+        scaled_size)
     desired_size = scaled_size
 
     random_jittering = (aug_scale_min != 1.0 or aug_scale_max != 1.0)
 
     if random_jittering:
-      random_scale = tf.random.uniform([],
-                                       aug_scale_min,
-                                       aug_scale_max,
-                                       seed=seed)
-      scaled_size = tf.math.round(random_scale * scaled_size)
+      random_scale = tf.random_uniform(
+          [], aug_scale_min, aug_scale_max, seed=seed)
+      scaled_size = tf.round(random_scale * scaled_size)
 
     # Computes 2D image_scale.
     image_scale = scaled_size / image_size
@@ -275,34 +293,178 @@ def resize_and_crop_image_v2(image,
     # desired_size.
     if random_jittering:
       max_offset = scaled_size - desired_size
-      max_offset = tf.where(
-          tf.math.less(max_offset, 0), tf.zeros_like(max_offset), max_offset)
-      offset = max_offset * tf.random.uniform([
-          2,
-      ], 0, 1, seed=seed)
+      max_offset = tf.where(tf.less(max_offset, 0),
+                            tf.zeros_like(max_offset),
+                            max_offset)
+      offset = max_offset * tf.random_uniform([2,], 0, 1, seed=seed)
       offset = tf.cast(offset, tf.int32)
     else:
       offset = tf.zeros((2,), tf.int32)
 
-    scaled_image = tf.image.resize(
+    scaled_image = tf.image.resize_images(
         image, tf.cast(scaled_size, tf.int32), method=method)
 
     if random_jittering:
-      scaled_image = scaled_image[offset[0]:offset[0] + desired_size[0],
-                                  offset[1]:offset[1] + desired_size[1], :]
+      scaled_image = scaled_image[
+          offset[0]:offset[0] + desired_size[0],
+          offset[1]:offset[1] + desired_size[1], :]
 
-    output_image = tf.image.pad_to_bounding_box(scaled_image, 0, 0,
-                                                padded_size[0], padded_size[1])
+    output_image = tf.image.pad_to_bounding_box(
+        scaled_image, 0, 0, padded_size[0], padded_size[1])
 
     image_info = tf.stack([
         image_size,
-        tf.cast(desired_size, dtype=tf.float32), image_scale,
-        tf.cast(offset, tf.float32)
-    ])
+        tf.cast(desired_size, dtype=tf.float32),
+        image_scale,
+        tf.cast(offset, tf.float32)])
     return output_image, image_info
 
 
-def resize_and_crop_boxes(boxes, image_scale, output_size, offset):
+def center_crop_image(image):
+  """Center crop a square shape slice from the input image.
+
+  It crops a square shape slice from the image. The side of the actual crop
+  is 224 / 256 = 0.875 of the short side of the original image. References:
+  [1] Very Deep Convolutional Networks for Large-Scale Image Recognition
+      https://arxiv.org/abs/1409.1556
+  [2] Deep Residual Learning for Image Recognition
+      https://arxiv.org/abs/1512.03385
+
+  Args:
+    image: a Tensor of shape [height, width, 3] representing the input image.
+
+  Returns:
+    cropped_image: a Tensor representing the center cropped image.
+  """
+  with tf.name_scope('center_crop_image'):
+    image_size = tf.cast(tf.shape(image)[:2], dtype=tf.float32)
+    crop_size = CENTER_CROP_FRACTION * tf.minimum(image_size[0], image_size[1])
+    crop_offset = tf.cast((image_size - crop_size) / 2.0, dtype=tf.int32)
+    crop_size = tf.cast(crop_size, dtype=tf.int32)
+    cropped_image = image[
+        crop_offset[0]:crop_offset[0] + crop_size,
+        crop_offset[1]:crop_offset[1] + crop_size, :]
+    return cropped_image
+
+
+def center_crop_image_v2(image_bytes, image_shape):
+  """Center crop a square shape slice from the input image.
+
+  It crops a square shape slice from the image. The side of the actual crop
+  is 224 / 256 = 0.875 of the short side of the original image. References:
+  [1] Very Deep Convolutional Networks for Large-Scale Image Recognition
+      https://arxiv.org/abs/1409.1556
+  [2] Deep Residual Learning for Image Recognition
+      https://arxiv.org/abs/1512.03385
+
+  This is a faster version of `center_crop_image` which takes the original
+  image bytes and image size as the inputs, and partially decode the JPEG
+  bytes according to the center crop.
+
+  Args:
+    image_bytes: a Tensor of type string representing the raw image bytes.
+    image_shape: a Tensor specifying the shape of the raw image.
+
+  Returns:
+    cropped_image: a Tensor representing the center cropped image.
+  """
+  with tf.name_scope('center_image_crop_v2'):
+    image_shape = tf.cast(image_shape, tf.float32)
+    crop_size = (
+        CENTER_CROP_FRACTION * tf.minimum(image_shape[0], image_shape[1]))
+    crop_offset = tf.cast((image_shape - crop_size) / 2.0, dtype=tf.int32)
+    crop_size = tf.cast(crop_size, dtype=tf.int32)
+    crop_window = tf.stack(
+        [crop_offset[0], crop_offset[1], crop_size, crop_size])
+    cropped_image = tf.image.decode_and_crop_jpeg(
+        image_bytes, crop_window, channels=3)
+    return cropped_image
+
+
+def random_crop_image(image,
+                      aspect_ratio_range=(3. / 4., 4. / 3.),
+                      area_range=(0.08, 1.0),
+                      max_attempts=10,
+                      seed=1):
+  """Randomly crop an arbitrary shaped slice from the input image.
+
+  Args:
+    image: a Tensor of shape [height, width, 3] representing the input image.
+    aspect_ratio_range: a list of floats. The cropped area of the image must
+      have an aspect ratio = width / height within this range.
+    area_range: a list of floats. The cropped reas of the image must contain
+      a fraction of the input image within this range.
+    max_attempts: the number of attempts at generating a cropped region of the
+      image of the specified constraints. After max_attempts failures, return
+      the entire image.
+    seed: the seed of the random generator.
+
+  Returns:
+    cropped_image: a Tensor representing the random cropped image. Can be the
+      original image if max_attempts is exhausted.
+  """
+  with tf.name_scope('random_crop_image'):
+    crop_offset, crop_size, _ = tf.image.sample_distorted_bounding_box(
+        tf.shape(image),
+        tf.constant([0.0, 0.0, 1.0, 1.0], dtype=tf.float32, shape=[1, 1, 4]),
+        seed=seed,
+        min_object_covered=area_range[0],
+        aspect_ratio_range=aspect_ratio_range,
+        area_range=area_range,
+        max_attempts=max_attempts)
+    cropped_image = tf.slice(image, crop_offset, crop_size)
+    return cropped_image
+
+
+def random_crop_image_v2(image_bytes,
+                         image_shape,
+                         aspect_ratio_range=(3. / 4., 4. / 3.),
+                         area_range=(0.08, 1.0),
+                         max_attempts=10,
+                         seed=1):
+  """Randomly crop an arbitrary shaped slice from the input image.
+
+  This is a faster version of `random_crop_image` which takes the original
+  image bytes and image size as the inputs, and partially decode the JPEG
+  bytes according to the generated crop.
+
+  Args:
+    image_bytes: a Tensor of type string representing the raw image bytes.
+    image_shape: a Tensor specifying the shape of the raw image.
+    aspect_ratio_range: a list of floats. The cropped area of the image must
+      have an aspect ratio = width / height within this range.
+    area_range: a list of floats. The cropped reas of the image must contain
+      a fraction of the input image within this range.
+    max_attempts: the number of attempts at generating a cropped region of the
+      image of the specified constraints. After max_attempts failures, return
+      the entire image.
+    seed: the seed of the random generator.
+
+  Returns:
+    cropped_image: a Tensor representing the random cropped image. Can be the
+      original image if max_attempts is exhausted.
+  """
+  with tf.name_scope('random_crop_image_v2'):
+    crop_offset, crop_size, _ = tf.image.sample_distorted_bounding_box(
+        image_shape,
+        tf.constant([0.0, 0.0, 1.0, 1.0], dtype=tf.float32, shape=[1, 1, 4]),
+        seed=seed,
+        min_object_covered=area_range[0],
+        aspect_ratio_range=aspect_ratio_range,
+        area_range=area_range,
+        max_attempts=max_attempts)
+    offset_y, offset_x, _ = tf.unstack(crop_offset)
+    crop_height, crop_width, _ = tf.unstack(crop_size)
+    crop_window = tf.stack([offset_y, offset_x, crop_height, crop_width])
+    cropped_image = tf.image.decode_and_crop_jpeg(
+        image_bytes, crop_window, channels=3)
+    return cropped_image
+
+
+def resize_and_crop_boxes(boxes,
+                          image_scale,
+                          output_size,
+                          offset):
   """Resizes boxes to output size with scale and offset.
 
   Args:
@@ -317,15 +479,19 @@ def resize_and_crop_boxes(boxes, image_scale, output_size, offset):
   Returns:
     boxes: `Tensor` of shape [N, 4] representing the scaled boxes.
   """
-  # Adjusts box coordinates based on image_scale and offset.
-  boxes *= tf.tile(tf.expand_dims(image_scale, axis=0), [1, 2])
-  boxes -= tf.tile(tf.expand_dims(offset, axis=0), [1, 2])
-  # Clips the boxes.
-  boxes = box_utils.clip_boxes(boxes, output_size)
-  return boxes
+  with tf.name_scope('resize_and_crop_boxes'):
+    # Adjusts box coordinates based on image_scale and offset.
+    boxes *= tf.tile(tf.expand_dims(image_scale, axis=0), [1, 2])
+    boxes -= tf.tile(tf.expand_dims(offset, axis=0), [1, 2])
+    # Clips the boxes.
+    boxes = box_utils.clip_boxes(boxes, output_size)
+    return boxes
 
 
-def resize_and_crop_masks(masks, image_scale, output_size, offset):
+def resize_and_crop_masks(masks,
+                          image_scale,
+                          output_size,
+                          offset):
   """Resizes boxes to output size with scale and offset.
 
   Args:
@@ -340,20 +506,31 @@ def resize_and_crop_masks(masks, image_scale, output_size, offset):
   Returns:
     masks: `Tensor` of shape [N, H, W, 1] representing the scaled masks.
   """
-  mask_size = tf.shape(input=masks)[1:3]
-  scaled_size = tf.cast(image_scale * tf.cast(mask_size, image_scale.dtype),
-                        tf.int32)
-  scaled_masks = tf.image.resize(
-      masks, scaled_size, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-  offset = tf.cast(offset, tf.int32)
-  scaled_masks = scaled_masks[:, offset[0]:offset[0] + output_size[0],
-                              offset[1]:offset[1] + output_size[1], :]
+  with tf.name_scope('resize_and_crop_masks'):
+    mask_size = tf.cast(tf.shape(masks)[1:3], tf.float32)
+    # Pad masks to avoid empty mask annotations.
+    masks = tf.concat([tf.zeros([1, mask_size[0], mask_size[1], 1],
+                                dtype=masks.dtype), masks], axis=0)
 
-  output_masks = tf.image.pad_to_bounding_box(scaled_masks, 0, 0,
-                                              output_size[0], output_size[1])
-  return output_masks
+    scaled_size = tf.cast(image_scale * mask_size, tf.int32)
+    scaled_masks = tf.image.resize_images(
+        masks, scaled_size, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+    offset = tf.cast(offset, tf.int32)
+    scaled_masks = scaled_masks[
+        :, offset[0]:offset[0] + output_size[0],
+        offset[1]:offset[1] + output_size[1], :]
+
+    output_masks = tf.image.pad_to_bounding_box(
+        scaled_masks, 0, 0, output_size[0], output_size[1])
+    # Remove padding.
+    output_masks = output_masks[1::]
+    return output_masks
 
 
-def random_horizontal_flip(image, boxes=None, masks=None):
+def random_horizontal_flip(image, boxes=None, masks=None, roi_boxes=None):
   """Randomly flips input image and bounding boxes."""
-  return preprocessor.random_horizontal_flip(image, boxes, masks)
+  results = preprocessor.random_horizontal_flip(image, boxes, masks, roi_boxes)
+  if boxes is None and masks is None and roi_boxes is None:
+    return results[0]
+  else:
+    return results
